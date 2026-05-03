@@ -3,20 +3,17 @@ from langgraph.graph import StateGraph, START, END
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 from langchain_core.prompts import PromptTemplate
 
-# 1. La mémoire : On stocke les actions du Recruteur ET du Juge
+# 1. On ajoute un booléen pour savoir si le Juge valide le travail du Recruteur
 class InterviewState(TypedDict):
     question_posee: str
     reponse_candidat: str
     contexte_rag: str
-    
-    # Sorties de l'Agent 1 (Recruteur)
     feedback_recruteur: str
     passed_recruteur: bool
-    
-    # Sorties de l'Agent 2 (Juge)
     verdict_juge: str
+    juge_est_daccord: bool # <-- NOUVEAUTÉ
 
-# --- NŒUD 1 : LA RECHERCHE DE VÉRITÉ (RAG) ---
+# --- NŒUD 1 : RAG ---
 def agent_rag(state: InterviewState):
     print(" RAG : Recherche de la théorie exacte dans FAISS...")
     from config.settings import FAISS_INDEX_PATH, EMBEDDING_MODEL_NAME
@@ -33,40 +30,41 @@ def agent_rag(state: InterviewState):
         
     return {"contexte_rag": vrai_contexte}
 
-# --- NŒUD 2 : L'AGENT 1 (LE RECRUTEUR) ---
+# --- NŒUD 2 : LE RECRUTEUR (QUI PEUT ÊTRE GRONDÉ PAR LE JUGE) ---
 def agent_1_recruteur(state: InterviewState):
-    print(" Agent 1 (Recruteur) : Analyse et prise de décision...")
+    print(" Agent 1 (Recruteur) : Analyse et rédaction du feedback...")
     
-    # Pour les modèles conversationnels, utiliser ChatHuggingFace wrapper
     llm_endpoint = HuggingFaceEndpoint(repo_id="Qwen/Qwen2.5-7B-Instruct", max_new_tokens=256, temperature=0.1)
     llm = ChatHuggingFace(llm=llm_endpoint)
     
-    template = """Tu es un recruteur technique. Évalue le candidat.
+    # LA MAGIE : Si on est dans une boucle et que le Juge a fait une critique, on l'injecte au Recruteur !
+    remarque_juge = ""
+    if state.get("verdict_juge", "") != "":
+        remarque_juge = f"\n ATTENTION ! Ton superviseur (Le Juge) a rejeté ton évaluation précédente avec cette critique :\n'{state['verdict_juge']}'\nTu DOIS corriger ton feedback pour le candidat en prenant en compte cette remarque.\n"
+    
+    template = f"""Tu es un recruteur technique. Évalue le candidat. {remarque_juge}
 1. Parle au candidat pour lui donner un feedback.
 2. À la fin, écris "DECISION: TRUE" s'il a bon, ou "DECISION: FALSE" s'il a faux.
 
-Théorie : {verite}
-Réponse du candidat : {reponse}
+Théorie : {{verite}}
+Réponse du candidat : {{reponse}}
 
 Ton feedback :"""
     
     prompt = PromptTemplate(input_variables=["verite", "reponse"], template=template)
     reponse_ia = (prompt | llm).invoke({"verite": state["contexte_rag"], "reponse": state["reponse_candidat"]})
     
-    # Extraction du contenu de la réponse
     reponse_text = reponse_ia.content if hasattr(reponse_ia, 'content') else str(reponse_ia)
     
-    # Parsing de la décision
     decision_bool = True if "DECISION: TRUE" in reponse_text.upper() else False
     feedback_propre = reponse_text.replace("DECISION: TRUE", "").replace("DECISION: FALSE", "").strip()
         
     return {"feedback_recruteur": feedback_propre, "passed_recruteur": decision_bool}
 
-# --- NŒUD 3 : L'AGENT 2 (LE JUGE DU RECRUTEUR) ---
+# --- NŒUD 3 : LE JUGE (QUI PEUT VALIDER OU REJETER LE RECRUTEUR) ---
 def agent_2_juge(state: InterviewState):
-    print(" Agent 2 (Juge) : Évaluation du travail du Recruteur...")
+    print(" Agent 2 (Juge) : Évaluation stricte du travail du Recruteur...")
     
-    # Pour les modèles conversationnels, utiliser ChatHuggingFace wrapper
     llm_endpoint = HuggingFaceEndpoint(repo_id="Qwen/Qwen2.5-7B-Instruct", max_new_tokens=256, temperature=0.1)
     llm = ChatHuggingFace(llm=llm_endpoint)
     
@@ -74,15 +72,16 @@ def agent_2_juge(state: InterviewState):
 Le recruteur a décidé que le candidat était : {decision_recruteur}.
 Voici ce que le recruteur a dit au candidat : "{feedback_recruteur}"
 
-Sachant que la théorie officielle est : "{verite}"
-Et que le candidat a répondu : "{reponse}"
+Théorie officielle : "{verite}"
+Réponse du candidat : "{reponse}"
 
-Le recruteur a-t-il pris la bonne décision (True/False) et donné un bon feedback ? Juge le recruteur sévèrement.
+Le recruteur a-t-il pris la bonne décision ? Son feedback est-il juste et précis ?
+1. Donne ton analyse.
+2. Termine OBLIGATOIREMENT par "SUPERVISION: VALIDE" si le recruteur a bien fait son travail, ou "SUPERVISION: REJETE" s'il s'est trompé, a été injuste ou incomplet.
 
-Ton verdict sur le recruteur :"""
+Ton verdict :"""
     
     prompt = PromptTemplate(input_variables=["decision_recruteur", "feedback_recruteur", "verite", "reponse"], template=template)
-    
     verdict_ia = (prompt | llm).invoke({
         "decision_recruteur": str(state["passed_recruteur"]),
         "feedback_recruteur": state["feedback_recruteur"],
@@ -90,10 +89,22 @@ Ton verdict sur le recruteur :"""
         "reponse": state["reponse_candidat"]
     })
     
-    # Extraction du contenu de la réponse
     verdict_text = verdict_ia.content if hasattr(verdict_ia, 'content') else str(verdict_ia)
+    
+    # Parsing de l'accord du Juge
+    juge_ok = True if "SUPERVISION: VALIDE" in verdict_text.upper() else False
+    verdict_propre = verdict_text.replace("SUPERVISION: VALIDE", "").replace("SUPERVISION: REJETE", "").strip()
         
-    return {"verdict_juge": verdict_text.strip()}
+    return {"verdict_juge": verdict_propre, "juge_est_daccord": juge_ok}
+
+# --- LA FONCTION D'AIGUILLAGE (QUI CRÉE LA BOUCLE) ---
+def route_apres_juge(state: InterviewState):
+    if state["juge_est_daccord"] == True:
+        print(" [ROUTAGE] Le Juge a validé le travail. Fin du processus.")
+        return END
+    else:
+        print(" [ROUTAGE] Le Juge a REJETÉ l'évaluation ! Renvoi au Recruteur pour correction...")
+        return "Recruteur"
 
 # --- CONSTRUCTION DU GRAPHE ---
 def build_interview_graph():
@@ -103,10 +114,18 @@ def build_interview_graph():
     workflow.add_node("Recruteur", agent_1_recruteur)
     workflow.add_node("Juge", agent_2_juge)
     
-    # L'ordre d'exécution !
     workflow.add_edge(START, "RAG")
     workflow.add_edge("RAG", "Recruteur")
-    workflow.add_edge("Recruteur", "Juge") # Le Juge passe toujours après le Recruteur
-    workflow.add_edge("Juge", END)
+    workflow.add_edge("Recruteur", "Juge") 
+    
+    # ON PLACE LA CONDITION APRÈS LE JUGE !
+    workflow.add_conditional_edges(
+        "Juge",
+        route_apres_juge,
+        {
+            END: END,
+            "Recruteur": "Recruteur" # La fameuse boucle !
+        }
+    )
     
     return workflow.compile()
