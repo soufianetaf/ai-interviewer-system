@@ -5,6 +5,8 @@ from langchain_core.prompts import PromptTemplate
 
 # 1. La mémoire : On accepte maintenant des LISTES de questions et réponses
 class InterviewState(TypedDict):
+    sujet_entretien: str
+    nombre_questions: int  
     questions: List[str]
     reponses: List[str]
     contextes_rag: List[str]
@@ -32,43 +34,56 @@ def agent_rag(state: InterviewState):
     except Exception as e:
         contextes_trouves = [f"Erreur : {str(e)}"] * len(state["questions"])
         
+    contextes_trouves = []
+    # On boucle sur chaque question présente dans l'état
+    for q in state["questions"]:
+        if q.strip(): # On ignore les lignes vides
+            docs = vectorstore.similarity_search(q, k=1)
+            contextes_trouves.append(docs[0].page_content if docs else "Théorie non trouvée.")
+    
     return {"contextes_rag": contextes_trouves}
 
-# --- NŒUD 2 : LE RECRUTEUR (ÉVALUATION GLOBALE) ---
+
+
+# --- NŒUD 2 : L'AGENT 1 (MAÎTRE DE L'ENTRETIEN) ---
 def agent_1_recruteur(state: InterviewState):
-    print(" Agent 1 (Recruteur) : Analyse globale de tout l'entretien...")
-    
-    llm_endpoint = HuggingFaceEndpoint(repo_id="Qwen/Qwen2.5-7B-Instruct", max_new_tokens=512, temperature=0.1)
+    llm_endpoint = HuggingFaceEndpoint(repo_id="Qwen/Qwen2.5-7B-Instruct", max_new_tokens=512, temperature=0.3)
     llm = ChatHuggingFace(llm=llm_endpoint)
-    
-    # On prépare le format texte de l'entretien
-    transcript = ""
-    for i in range(len(state["questions"])):
-        transcript += f"\nQ{i+1}: {state['questions'][i]}\nRéponse: {state['reponses'][i]}\nThéorie: {state['contextes_rag'][i]}\n"
-    
-    remarque_juge = ""
-    if state.get("verdict_juge", "") != "":
-        remarque_juge = f"\n Le Juge a rejeté ton évaluation globale avec cette critique :\n'{state['verdict_juge']}'\nCorrige ton verdict !\n"
-    
-    template = f"""Tu es un recruteur technique principal. Évalue l'ensemble de l'entretien du candidat. {remarque_juge}
-Voici la transcription de l'entretien complet (Questions, Réponses du candidat, et la Théorie officielle) :
-{transcript}
 
-Mission :
-1. Fais un bilan global au candidat sur ses forces et ses erreurs durant cet entretien.
-2. À la toute fin, écris "DECISION: TRUE" si le candidat mérite le poste globalement (plus de bonnes que de mauvaises réponses), ou "DECISION: FALSE" s'il a trop de lacunes.
-
-Ton bilan global :"""
-    
-    prompt = PromptTemplate(input_variables=[], template=template)
-    reponse_ia = (prompt | llm).invoke({})
-    
-    reponse_text = reponse_ia.content if hasattr(reponse_ia, 'content') else str(reponse_ia)
-    
-    decision_bool = True if "DECISION: TRUE" in reponse_text.upper() else False
-    feedback_propre = reponse_text.replace("DECISION: TRUE", "").replace("DECISION: FALSE", "").strip()
+    # PHASE 1 : GÉNÉRATION (Si aucune réponse n'est présente)
+    if not state.get("reponses") :
+        print(f" Agent 1 : Génération de {state['nombre_questions']} questions sur '{state['sujet_entretien']}'...")
         
-    return {"feedback_recruteur": feedback_propre, "passed_recruteur": decision_bool}
+        template = """Tu es un recruteur technique. Génère {n} questions sur {sujet}.
+        Format STRICT : une question par ligne commençant par 'Q:'. Rien d'autre."""
+        
+        prompt = PromptTemplate(input_variables=["n", "sujet"], template=template)
+        reponse = (prompt | llm).invoke({"n": state["nombre_questions"], "sujet": state["sujet_entretien"]})
+        
+        questions = [q.replace("Q:", "").strip() for q in reponse.content.split("\n") if "Q:" in q]
+        return {"questions": questions}
+
+    # PHASE 2 : ÉVALUATION (Si les réponses sont là)
+    else:
+        print(" Agent 1 : Analyse des réponses et verdict final...")
+        
+        nb_a_analyser = min(len(state["questions"]), len(state["reponses"]), len(state["contextes_rag"]))
+        
+        transcript = ""
+        for i in range(nb_a_analyser):
+            transcript += f"\nQ: {state['questions'][i]}\nR: {state['reponses'][i]}\nThéorie: {state['contextes_rag'][i]}\n"
+        
+        template_eval = f"""Évalue cet entretien. Sois précis.
+        {transcript}
+        Termine par DECISION: TRUE ou DECISION: FALSE.
+        Bilan :"""
+        
+        reponse_ia = llm.invoke(template_eval)
+        text = reponse_ia.content
+        return {
+            "feedback_recruteur": text.replace("DECISION: TRUE", "").replace("DECISION: FALSE", "").strip(),
+            "passed_recruteur": "DECISION: TRUE" in text.upper()
+        }
 
 # --- NŒUD 3 : LE JUGE (SUPERVISION FINALE) ---
 def agent_2_juge(state: InterviewState):
@@ -114,16 +129,31 @@ def route_apres_juge(state: InterviewState):
     else:
         return "Recruteur"
 
+
+def route_apres_recruteur(state: InterviewState):
+    # Si on vient de générer les questions et qu'on n'a pas encore de réponses -> STOP
+    if state.get("questions") and not state.get("reponses"):
+        return END
+    # Sinon, on continue vers le RAG puis le Juge
+    return "RAG"
 # --- CONSTRUCTION DU GRAPHE ---
 def build_interview_graph():
     workflow = StateGraph(InterviewState)
-    workflow.add_node("RAG", agent_rag)
+    
     workflow.add_node("Recruteur", agent_1_recruteur)
+    workflow.add_node("RAG", agent_rag)
     workflow.add_node("Juge", agent_2_juge)
     
-    workflow.add_edge(START, "RAG")
-    workflow.add_edge("RAG", "Recruteur")
-    workflow.add_edge("Recruteur", "Juge") 
+    workflow.add_edge(START, "Recruteur")
+    
+    # Aiguillage : Stop après génération OU continue vers évaluation
+    workflow.add_conditional_edges(
+        "Recruteur",
+        route_apres_recruteur,
+        {"RAG": "RAG", END: END}
+    )
+    
+    workflow.add_edge("RAG", "Juge")
     workflow.add_conditional_edges("Juge", route_apres_juge, {END: END, "Recruteur": "Recruteur"})
     
     return workflow.compile()
