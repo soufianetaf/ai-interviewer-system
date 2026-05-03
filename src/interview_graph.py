@@ -1,69 +1,112 @@
-# src/interview_graph.py
-
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
+from langchain_core.prompts import PromptTemplate
 
-# 1. Définition de la mémoire partagée (L'État du Graphe)
+# 1. La mémoire : On stocke les actions du Recruteur ET du Juge
 class InterviewState(TypedDict):
     question_posee: str
     reponse_candidat: str
     contexte_rag: str
-    evaluation_finale: str
+    
+    # Sorties de l'Agent 1 (Recruteur)
+    feedback_recruteur: str
+    passed_recruteur: bool
+    
+    # Sorties de l'Agent 2 (Juge)
+    verdict_juge: str
 
-# 2. Le Nœud du Juge (Le RAG)
-def agent_juge_rag(state: InterviewState):
-    print("👨 Juge : Recherche de la vérité dans la base de connaissances (FAISS)...")
-    
-    # On charge la base FAISS que l'on a créée tout à l'heure
+# --- NŒUD 1 : LA RECHERCHE DE VÉRITÉ (RAG) ---
+def agent_rag(state: InterviewState):
+    print(" RAG : Recherche de la théorie exacte dans FAISS...")
     from config.settings import FAISS_INDEX_PATH, EMBEDDING_MODEL_NAME
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    from langchain_community.vectorstores import FAISS
+    from langchain_huggingface import HuggingFaceEmbeddings
     
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
     try:
-        # allow_dangerous_deserialization est requis pour lire les fichiers .pkl locaux en toute sécurité
         vectorstore = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
-        
-        # On cherche la vraie réponse par rapport à la question posée
         docs = vectorstore.similarity_search(state["question_posee"], k=1)
         vrai_contexte = docs[0].page_content if docs else "Aucune info trouvée."
     except Exception as e:
-        vrai_contexte = f"Erreur de lecture de la base : {str(e)}"
+        vrai_contexte = f"Erreur : {str(e)}"
         
-    # On met à jour la mémoire avec ce qu'on a trouvé
     return {"contexte_rag": vrai_contexte}
 
-# 3. Le Nœud du Recruteur (L'évaluateur LLM)
-def agent_recruteur_llm(state: InterviewState):
-    print(" Recruteur : Analyse de la réponse du candidat...")
+# --- NŒUD 2 : L'AGENT 1 (LE RECRUTEUR) ---
+def agent_1_recruteur(state: InterviewState):
+    print(" Agent 1 (Recruteur) : Analyse et prise de décision...")
     
-    # Ici, nous simulerons l'appel au LLM (HuggingFace) pour l'instant
-    # Dans la prochaine étape, on branchera le vrai modèle !
+    # Pour les modèles conversationnels, utiliser ChatHuggingFace wrapper
+    llm_endpoint = HuggingFaceEndpoint(repo_id="Qwen/Qwen2.5-7B-Instruct", max_new_tokens=256, temperature=0.1)
+    llm = ChatHuggingFace(llm=llm_endpoint)
     
-    reponse_candidat = state["reponse_candidat"]
-    verite = state["contexte_rag"]
-    
-    # Logique simplifiée en attendant le LLM
-    if len(reponse_candidat) > 10:
-        feedback = f"Bonne tentative. \n La théorie exacte dit : '{verite}'"
-    else:
-        feedback = f"Réponse trop courte. \n La théorie exacte dit : '{verite}'"
-        
-    return {"evaluation_finale": feedback}
+    template = """Tu es un recruteur technique. Évalue le candidat.
+1. Parle au candidat pour lui donner un feedback.
+2. À la fin, écris "DECISION: TRUE" s'il a bon, ou "DECISION: FALSE" s'il a faux.
 
-# 4. Construction du Circuit (Le Graphe)
+Théorie : {verite}
+Réponse du candidat : {reponse}
+
+Ton feedback :"""
+    
+    prompt = PromptTemplate(input_variables=["verite", "reponse"], template=template)
+    reponse_ia = (prompt | llm).invoke({"verite": state["contexte_rag"], "reponse": state["reponse_candidat"]})
+    
+    # Extraction du contenu de la réponse
+    reponse_text = reponse_ia.content if hasattr(reponse_ia, 'content') else str(reponse_ia)
+    
+    # Parsing de la décision
+    decision_bool = True if "DECISION: TRUE" in reponse_text.upper() else False
+    feedback_propre = reponse_text.replace("DECISION: TRUE", "").replace("DECISION: FALSE", "").strip()
+        
+    return {"feedback_recruteur": feedback_propre, "passed_recruteur": decision_bool}
+
+# --- NŒUD 3 : L'AGENT 2 (LE JUGE DU RECRUTEUR) ---
+def agent_2_juge(state: InterviewState):
+    print(" Agent 2 (Juge) : Évaluation du travail du Recruteur...")
+    
+    # Pour les modèles conversationnels, utiliser ChatHuggingFace wrapper
+    llm_endpoint = HuggingFaceEndpoint(repo_id="Qwen/Qwen2.5-7B-Instruct", max_new_tokens=256, temperature=0.1)
+    llm = ChatHuggingFace(llm=llm_endpoint)
+    
+    template = """Tu es le Juge Principal. Tu dois évaluer le travail d'un recruteur (Agent 1).
+Le recruteur a décidé que le candidat était : {decision_recruteur}.
+Voici ce que le recruteur a dit au candidat : "{feedback_recruteur}"
+
+Sachant que la théorie officielle est : "{verite}"
+Et que le candidat a répondu : "{reponse}"
+
+Le recruteur a-t-il pris la bonne décision (True/False) et donné un bon feedback ? Juge le recruteur sévèrement.
+
+Ton verdict sur le recruteur :"""
+    
+    prompt = PromptTemplate(input_variables=["decision_recruteur", "feedback_recruteur", "verite", "reponse"], template=template)
+    
+    verdict_ia = (prompt | llm).invoke({
+        "decision_recruteur": str(state["passed_recruteur"]),
+        "feedback_recruteur": state["feedback_recruteur"],
+        "verite": state["contexte_rag"],
+        "reponse": state["reponse_candidat"]
+    })
+    
+    # Extraction du contenu de la réponse
+    verdict_text = verdict_ia.content if hasattr(verdict_ia, 'content') else str(verdict_ia)
+        
+    return {"verdict_juge": verdict_text.strip()}
+
+# --- CONSTRUCTION DU GRAPHE ---
 def build_interview_graph():
-    # On initialise le graphe avec notre structure de mémoire
     workflow = StateGraph(InterviewState)
     
-    # On ajoute nos deux agents
-    workflow.add_node("Juge", agent_juge_rag)
-    workflow.add_node("Recruteur", agent_recruteur_llm)
+    workflow.add_node("RAG", agent_rag)
+    workflow.add_node("Recruteur", agent_1_recruteur)
+    workflow.add_node("Juge", agent_2_juge)
     
-    # On définit le sens de circulation
-    workflow.add_edge(START, "Juge")        # 1. On commence par chercher la vérité
-    workflow.add_edge("Juge", "Recruteur")  # 2. Puis on donne la vérité et la réponse au recruteur
-    workflow.add_edge("Recruteur", END)     # 3. Fin de l'évaluation
+    # L'ordre d'exécution !
+    workflow.add_edge(START, "RAG")
+    workflow.add_edge("RAG", "Recruteur")
+    workflow.add_edge("Recruteur", "Juge") # Le Juge passe toujours après le Recruteur
+    workflow.add_edge("Juge", END)
     
-    # On compile le tout
     return workflow.compile()
