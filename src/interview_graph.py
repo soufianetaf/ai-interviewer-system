@@ -189,7 +189,7 @@ Pour chaque question, donne :
 
 Ensuite :
   - Mon score total : X/{score_max}
-  - Ma décision : EMBAUCHE si (score / score_max * 100) >= 60, sinon REJET
+  - Ma décision : Calcule : (score total / score maximum) * 100. Si >= 60 → EMBAUCHE. Si < 60 → REJET. Exemple : 9/15 = 60% → EMBAUCHE.
 
 Évaluation indépendante :"""
 
