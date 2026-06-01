@@ -2,6 +2,7 @@ from typing import TypedDict, List
 from langgraph.graph import StateGraph, START, END
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 from langchain_core.prompts import PromptTemplate
+from databricks_langchain import ChatDatabricks
 
 
 # --- ÉTAT PARTAGÉ ---
@@ -17,8 +18,8 @@ class InterviewState(TypedDict):
     juge_est_daccord: bool
     iteration: int
     historique_juge: List[str]
-    notes_juge_independant: str   # ← NEW : évaluation aveugle du Juge
-    ecart_total: int              # ← NEW : écart calculé en Python
+    notes_juge_independant: str   
+    ecart_total: int              
 
 # --- NŒUD 1 : RAG EN LOT ---
 def agent_rag(state: InterviewState):
@@ -54,6 +55,7 @@ def agent_1_recruteur(state: InterviewState):
         temperature=0.3,
     )
     llm = ChatHuggingFace(llm=llm_endpoint)
+    
 
     # PHASE 1 : GÉNÉRATION (aucune réponse → on génère les questions)
     if not state.get("reponses"):
